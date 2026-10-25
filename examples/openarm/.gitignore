@@ -1,0 +1,12 @@
+# Local data, checkpoints, and logs (never commit these).
+data/
+lerobot_data/
+checkpoints/
+wandb/
+logs/
+*.hdf5
+*.mp4
+*.parquet
+
+# Real environment file (copy from openarm_env.example.sh).
+scripts/openarm_env.sh

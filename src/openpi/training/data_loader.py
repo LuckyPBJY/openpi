@@ -62,6 +62,27 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class EpisodeSubsetDataset(Dataset[T_co]):
+    """Select frames from a full LeRobot dataset by original episode indices.
+
+    The pinned LeRobot ``episodes=`` argument is broken for non-contiguous
+    episode selections: its ``episode_data_index`` is rebuilt with only the
+    selected episodes, but ``__getitem__`` still passes the original episode
+    index (e.g. 133) and raises IndexError. Load the full dataset and map
+    filtered indices to the original frame indices instead.
+    """
+
+    def __init__(self, dataset: Dataset, global_indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = list(global_indices)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[self._indices[index]]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -143,7 +164,17 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        # torchcodec needs FFmpeg shared libraries. Set LD_LIBRARY_PATH to the
+        # directory that contains libavutil/libavcodec before running.
+        video_backend="torchcodec",
     )
+    if data_config.episodes is not None:
+        starts = dataset.episode_data_index["from"]
+        ends = dataset.episode_data_index["to"]
+        global_indices = []
+        for ep in data_config.episodes:
+            global_indices.extend(range(int(starts[ep]), int(ends[ep])))
+        dataset = EpisodeSubsetDataset(dataset, global_indices)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

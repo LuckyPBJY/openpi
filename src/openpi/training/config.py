@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.openarm_policy as openarm_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -89,6 +90,9 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Optional LeRobot episode indices to restrict the dataset (train/val split).
+    episodes: Sequence[int] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -356,6 +360,131 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotOpenArmDataConfig(DataConfigFactory):
+    """Data config for the OpenArm dual-arm dataset (joint-space route).
+
+    Dataset produced by ``scripts/convert_openarm_data_to_lerobot.py``:
+    state/action are 16-dim (7 joints + gripper per arm); three cameras.
+    Joint dims are converted to deltas relative to the current state; grippers stay absolute.
+    """
+
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "head": "observation.images.head",
+                            "left_wrist": "observation.images.left_wrist",
+                            "right_wrist": "observation.images.right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    # LeRobot convention stores actions under "action"; openpi expects "actions" after repacking.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[openarm_policy.OpenArmInputs(model_type=model_config.model_type)],
+            outputs=[openarm_policy.OpenArmOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            # [7 left joints, left gripper, 7 right joints, right gripper]
+            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotOpenArmEEDataConfig(DataConfigFactory):
+    """Data config for the OpenArm dual-arm dataset (end-effector route).
+
+    Dataset: ``openarm/cropped_20261018_joint_eef``.
+    state: current EE pose + gripper (16 dims).
+    action: world-frame delta position + rotation vector + absolute gripper
+    (7 dims per arm, 14 total).
+    """
+
+    use_delta_eef_actions: bool = True
+    # Legacy option: mean command-vs-actual bias compensation in the observation.
+    # New routes should keep this False (raw observation frame).
+    use_bias_correction: bool = False
+    default_prompt: str | None = None
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "head": "observation.images.head",
+                            "left_wrist": "observation.images.left_wrist",
+                            "right_wrist": "observation.images.right_wrist",
+                        },
+                        "state_eef": "observation.eef",
+                        "state_joint": "observation.state",
+                        "actions_eef": "action.eef",
+                        "actions_joint": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    # Both sequences are chunked: eef for the action target, joint for gripper commands.
+    action_sequence_keys: Sequence[str] = ("action", "action.eef")
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                openarm_policy.OpenArmEEInputs(
+                    model_type=model_config.model_type,
+                    use_bias_correction=self.use_bias_correction,
+                )
+            ],
+            outputs=[openarm_policy.OpenArmEEOutputs()],
+        )
+        if self.use_delta_eef_actions:
+            data_transforms = data_transforms.push(
+                inputs=[openarm_policy.EEFDeltaActions()],
+                outputs=[openarm_policy.EEFAbsoluteActions()],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -557,6 +686,24 @@ class TrainConfig:
 
 
 # Use `get_config` if you need to get a config by name in your code.
+# 2026-10-25 dataset split: 145 episodes, 120 train / 25 val, seed 42.
+# Indices are LeRobot episode indices; the source-file mapping is in
+# logs/split_20261025/split.json.
+_TRAIN_EPISODES_20261025 = (
+    1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23,
+    26, 27, 28, 29, 30, 31, 32, 34, 35, 36, 38, 39, 40, 41, 42, 43, 44,
+    45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 57, 58, 59, 60, 61, 62,
+    63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 79, 80,
+    82, 83, 84, 85, 86, 88, 89, 90, 91, 92, 93, 94, 96, 97, 99, 100, 102,
+    103, 104, 105, 106, 109, 110, 112, 113, 114, 115, 116, 117, 118, 121,
+    122, 123, 125, 128, 129, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+    140, 141, 142, 143, 144,
+)
+_VAL_EPISODES_20261025 = (
+    0, 2, 3, 4, 20, 24, 25, 33, 37, 56, 78, 81, 87, 95, 98, 101, 107, 108,
+    111, 119, 120, 124, 126, 127, 130,
+)
+
 _CONFIGS = [
     #
     # Inference Aloha configs.
@@ -759,6 +906,187 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    #
+    # OpenArm dual-arm config (joint-space route).
+    #
+    TrainConfig(
+        name="pi05_openarm",
+        # action_horizon=30 at 30 Hz = 1 second of action chunking.
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="openarm/cropped_20261018_joint",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # Full pi05 fine-tuning needs >70 GB; lower batch_size if using a smaller GPU.
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_openarm_lora",
+        # LoRA variant: full joint fine-tuning also OOMs on a single H100 80GB.
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="openarm/cropped_20261018_joint",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_openarm_eef",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotOpenArmEEDataConfig(
+            repo_id="openarm/cropped_20261018_joint_eef",
+            # Legacy checkpoint: trained with the old mean-bias compensation.
+            use_bias_correction=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_openarm_eef_lora",
+        # LoRA variant: fits a single H100 80GB (full fine-tuning OOMs even at batch 1).
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmEEDataConfig(
+            repo_id="openarm/cropped_20261018_joint_eef",
+            # Legacy checkpoint: trained with the old mean-bias compensation.
+            use_bias_correction=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # EMA is disabled for LoRA fine-tuning (as in the official low-memory examples).
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    #
+    # OpenArm 2026-10-25 dataset (120 train / 25 val, new long-horizon task).
+    #
+    TrainConfig(
+        name="pi05_openarm_20261025_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmDataConfig(
+            repo_id="openarm/cropped_20261025_joint_eef",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes=_TRAIN_EPISODES_20261025,
+            ),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_openarm_20261025_eef_raw_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmEEDataConfig(
+            repo_id="openarm/cropped_20261025_joint_eef",
+            # Raw route: no eef_obs_to_cmd / mean-bias compensation.
+            use_bias_correction=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes=_TRAIN_EPISODES_20261025,
+            ),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
     #
